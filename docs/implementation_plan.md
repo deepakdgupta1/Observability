@@ -318,6 +318,9 @@ sequenceDiagram
 
 ## 4. Interception Layer: The OAuth Proxy Solution
 
+> [!NOTE]
+> **Confirmed Constraint (July 2026)**: eBPF-based traffic interception — which could theoretically avoid the mitmproxy CA cert trust requirement — is **not viable on macOS** for this use case. macOS's kernel extensions (`fbffis`, Endpoint Security framework) do not expose the network-layer eBPF interception primitives needed to transparently intercept HTTPS traffic. Linux eBPF tools (Inspektor Gadget, Cilium, Pixie) target server-side workloads and have no macOS equivalent for client-side LLM API interception. The mitmproxy + CA cert approach remains the only viable interception path on macOS as of July 2026.
+
 ### 4.1 Problem Statement
 
 All major AI coding agents authenticate with their providers via **OAuth 2.0 flows** — not user-supplied API keys. This means:
@@ -482,7 +485,7 @@ def _stream_to_disk(self, flow):
 
 ### 5.1 Trace Hierarchy (OTel-Aligned)
 
-The system uses a **four-level span hierarchy** aligned with OpenTelemetry GenAI Semantic Conventions (v1.40.0). Spans are categorized by observability source:
+The system uses a **four-level span hierarchy** aligned with OpenTelemetry GenAI Semantic Conventions (**v1.43.0**, July 2026). As of May 2026, GenAI semantic conventions have moved to a **dedicated repository**: [`open-telemetry/semantic-conventions-genai`](https://github.com/open-telemetry/semantic-conventions-genai). The conventions now define formal span types for **GenAI client inference** (`gen_ai`), **agent operations** (`gen_ai.agent`), **tool execution** (`gen_ai.tool`), **evaluation**, and **Model Context Protocol (MCP)** operations — all directly relevant to this system's trace hierarchy. Provider-specific conventions now exist for Anthropic, OpenAI, AWS Bedrock, and Azure AI Inference, defining exact attribute mappings that the worker can consume directly rather than hand-rolling. Spans are categorized by observability source:
 
 ```
 Session Span (top-level) ........................... [CONSTRUCTED — from proxy-auth session ID]
@@ -526,38 +529,75 @@ Skill discovery efficiency (metric EF-10) is tracked by analyzing the **request 
 
 This is primarily computed via **offline evaluation** — the eval pipeline reviews traces where skill-eligible tasks were performed and scores whether the agent found and used the appropriate skill.
 
-### 5.3 Span Attributes (`llm.*` Namespace)
+### 5.3 Span Attributes (`gen_ai.*` Namespace — OTel v1.43.0 Aligned)
+
+> [!IMPORTANT]
+> **Namespace Alignment (Updated July 2026)**: The official OTel GenAI semantic conventions use the `gen_ai.*` namespace. This system emits `gen_ai.*` attributes as the **primary namespace** for all spans exported to Phoenix and any OTel-compatible backend. A mapping layer (see `gen_ai.*` ↔ legacy `llm.*` mapping table below) is maintained for backward compatibility with any custom tools that referenced the original `llm.*` conventions from earlier FRS versions. Provider-specific attribute mappings (Anthropic, OpenAI, Google) now have formal definitions in the `semantic-conventions-genai` repository and should be consumed directly rather than hand-rolled.
+>
+> **Key `gen_ai.*` attribute groups** (per official v1.43.0 conventions):
+> - `gen_ai.system` — Provider name (`anthropic`, `openai`, `google`)
+> - `gen_ai.request.model` / `gen_ai.response.model` — Model ID
+> - `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` — Token counts
+> - `gen_ai.usage.reasoning_tokens` — Thinking/reasoning token count
+> - `gen_ai.tool.name` / `gen_ai.tool.description` — Tool call attributes
+> - `gen_ai.agent.*` — Agent-level attributes (new formal span type)
+> - MCP-specific attributes per the `mcp.md` conventions document
+
+#### Legacy `llm.*` → `gen_ai.*` Mapping Table
+
+The following table maps the original FRS attribute names to the official OTel v1.43.0 `gen_ai.*` equivalents. New code MUST use `gen_ai.*`. The `llm.*` names are retained only for reference.
+
+| Original (`llm.*`) | Official (`gen_ai.*`) | Notes |
+|:---|:---|:---|
+| `llm.system` | `gen_ai.system` | Provider name |
+| `llm.request.model` | `gen_ai.request.model` | Model ID |
+| `llm.request.temperature` | `gen_ai.request.temperature` | Sampling temperature |
+| `llm.request.max_tokens` | `gen_ai.request.max_tokens` | Max output tokens |
+| `llm.request.top_p` | `gen_ai.request.top_p` | Nucleus sampling |
+| `llm.response.model` | `gen_ai.response.model` | Actual model used |
+| `llm.response.finish_reason` | `gen_ai.response.finish_reason` | Stop reason |
+| `llm.usage.input_tokens` | `gen_ai.usage.input_tokens` | Input token count |
+| `llm.usage.output_tokens` | `gen_ai.usage.output_tokens` | Output token count |
+| `llm.usage.reasoning_tokens` | `gen_ai.usage.reasoning_tokens` | Thinking tokens |
+| `llm.usage.cache_read_tokens` | `gen_ai.usage.cache_read_input_tokens` | Cached tokens served |
+| `llm.usage.cache_creation_tokens` | `gen_ai.usage.cache_creation_input_tokens` | Tokens written to cache |
+| `llm.latency.ttft_ms` | `gen_ai.response.ttft_ms` | Time to first token |
+| `llm.latency.total_ms` | `gen_ai.response.total_duration_ms` | Total request duration |
+| `llm.agent.name` | `gen_ai.agent.name` (custom) | Agent name — not in official spec, use custom attr |
+| `llm.agent.version` | `gen_ai.agent.version` (custom) | Agent version — not in official spec |
+| `tool.name` | `gen_ai.tool.name` | Tool function name |
+| `tool.parameters` | `gen_ai.tool.input` (JSON) | Tool call parameters |
 
 > [!NOTE]
-> **Naming Convention**: All attributes use the `llm.*` namespace prefix instead of the OTel default `gen_ai.*`, per project convention. When exporting to external tools, a mapping layer can translate `llm.*` → `gen_ai.*` if needed.
+> **Custom Attributes**: Agent name, agent version, session IDs, and context-composition attributes (system prompt tokens, tool definition tokens, etc.) have no official `gen_ai.*` equivalent. These are emitted as **custom attributes** with a `gen_ai.agent.*` or `obs.*` prefix, clearly distinguished from the standardized namespace.
 
 #### Session Span Attributes
 | Attribute | Type | Description |
 |:---|:---|:---|
 | `session.id` | string | Unique session identifier |
-| `llm.agent.name` | string | Agent name (e.g., "claude-code", "antigravity") |
-| `llm.agent.version` | string | Agent version |
-| `llm.agent.parent` | string | Parent agent name (for sub-agents, e.g., "antigravity") |
+| `gen_ai.agent.name` | string | Agent name (e.g., "claude-code", "antigravity") |
+| `gen_ai.agent.version` | string | Agent version |
+| `gen_ai.agent.parent` | string | Parent agent name (for sub-agents, e.g., "antigravity") |
 | `session.start_time` | timestamp | Session start |
 | `session.user_objective` | string | Initial user prompt (if capturable) |
 
 #### LLM Request Span Attributes
 | Attribute | Type | Description |
 |:---|:---|:---|
-| `llm.system` | string | Provider name (e.g., "anthropic", "openai") |
-| `llm.request.model` | string | Model ID (e.g., "claude-sonnet-4-20250514") |
-| `llm.request.temperature` | float | Sampling temperature |
-| `llm.request.max_tokens` | int | Max output tokens requested |
-| `llm.request.top_p` | float | Nucleus sampling parameter |
-| `llm.response.model` | string | Actual model used (may differ from requested) |
-| `llm.response.finish_reason` | string | `stop`, `max_tokens`, `tool_use`, etc. |
-| `llm.usage.input_tokens` | int | Input token count |
-| `llm.usage.output_tokens` | int | Output token count |
-| `llm.usage.reasoning_tokens` | int | Thinking/reasoning token count |
-| `llm.usage.cache_read_tokens` | int | Tokens served from cache |
-| `llm.usage.cache_creation_tokens` | int | Tokens written to cache |
-| `llm.latency.ttft_ms` | float | Time to first token (ms) |
-| `llm.latency.total_ms` | float | Total request duration (ms) |
+| `gen_ai.system` | string | Provider name (e.g., "anthropic", "openai") |
+| `gen_ai.request.model` | string | Model ID (e.g., "claude-sonnet-4-20250514") |
+| `gen_ai.request.temperature` | float | Sampling temperature |
+| `gen_ai.request.max_tokens` | int | Max output tokens requested |
+| `gen_ai.request.top_p` | float | Nucleus sampling parameter |
+| `gen_ai.response.model` | string | Actual model used (may differ from requested) |
+| `gen_ai.response.finish_reason` | string | `stop`, `max_tokens`, `tool_use`, etc. |
+| `gen_ai.usage.input_tokens` | int | Input token count |
+| `gen_ai.usage.output_tokens` | int | Output token count |
+| `gen_ai.usage.reasoning_tokens` | int | Thinking/reasoning token count |
+| `gen_ai.usage.cache_read_input_tokens` | int | Tokens served from cache |
+| `gen_ai.usage.cache_creation_input_tokens` | int | Tokens written to cache |
+| `gen_ai.response.ttft_ms` | float | Time to first token (ms) |
+| `gen_ai.response.total_duration_ms` | float | Total request duration (ms) |
 
 #### Context Composition Event Schema
 | Field | Type | Description |
@@ -820,6 +860,47 @@ unknown_model_policy: "warn_and_log"
 > [!IMPORTANT]
 > **Pricing Drift**: Provider pricing changes frequently. The pricing file is version-controlled and should be updated monthly. The system logs a warning when a model is encountered that has no pricing entry.
 
+#### LiteLLM Pricing Sync (Added July 2026)
+
+> [!NOTE]
+> **SOTA Update (July 2026)**: [LiteLLM](https://github.com/BerriAI/litellm) maintains `model_prices_and_context_window.json` — a comprehensive, community-maintained, machine-readable pricing database covering all major LLM providers. It includes `input_cost_per_token`, `output_cost_per_token`, `output_cost_per_reasoning_token`, `cache_read_input_token_cost`, `supports_prompt_caching`, `supports_reasoning`, and `max_input_tokens` / `max_output_tokens` context window sizes. This is the de-facto canonical multi-provider pricing source in the LLM ecosystem and is updated within hours of new model releases.
+
+**Strategy**: Instead of maintaining pricing manually, sync from LiteLLM's JSON:
+
+1. **`pricing_sync.py`** runs daily (elapsed-time trigger, same pattern as eval scheduler) and fetches the latest `model_prices_and_context_window.json` from the LiteLLM GitHub repo.
+2. The script **filters** the JSON to only the providers this system monitors (Anthropic, OpenAI, Google) and writes a local `pricing_cache.json`.
+3. **Local overrides**: A `pricing_overrides.yaml` file allows per-model price overrides (e.g., for negotiated rates or custom models). Overrides take precedence over the LiteLLM data.
+4. The worker reads pricing from `pricing_cache.json` with `pricing_overrides.yaml` layered on top.
+5. If the sync fails (network unavailable, GitHub down), the worker falls back to the last successfully cached file. Pricing is never blocked by sync failures.
+
+```python
+# pricing_sync.py — simplified pseudocode
+import json, urllib.request, pathlib, datetime
+
+LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+SUPPORTED_PROVIDERS = {"anthropic", "openai", "google", "gemini"}
+CACHE_PATH = pathlib.Path("~/.observability/pricing_cache.json").expanduser()
+
+def sync_pricing():
+    try:
+        data = json.loads(urllib.request.urlopen(LITELLM_URL, timeout=30).read())
+        filtered = {
+            model: info for model, info in data.items()
+            if any(p in model.lower() or info.get("litellm_provider", "").startswith(p)
+                   for p in SUPPORTED_PROVIDERS)
+               and model != "sample_spec"  # skip LiteLLM's template entry
+        }
+        filtered["_sync_timestamp"] = datetime.datetime.now().isoformat()
+        filtered["_source"] = "litellm/model_prices_and_context_window.json"
+        CACHE_PATH.write_text(json.dumps(filtered, indent=2))
+    except Exception as e:
+        print(f"Pricing sync failed, using cached data: {e}")
+        # Fallback: last cached file remains valid
+```
+
+> [!IMPORTANT]
+> **Relationship to `pricing.yaml`**: The hand-maintained `pricing.yaml` above is retained as the **override mechanism** for the Phase 1 MVP (when you may want to test quickly without the sync). The `pricing_sync.py` script is the **primary pricing source** for production operation. The worker checks `pricing_overrides.yaml` → `pricing_cache.json` (from LiteLLM) → `pricing.yaml` (manual fallback) in that order of precedence.
+
 ---
 
 ## 8. Context Composition Analysis Engine
@@ -868,6 +949,21 @@ def estimate_tokens(text: str, primary_tokenizer, secondary_tokenizer) -> int:
 > [!NOTE]
 > **Rationale**: Using the larger value when counts diverge significantly ensures we don't underestimate token consumption, which is critical for accurate context window utilization tracking (metric EF-01) and cost calculation.
 
+#### Optional Precision Mode: Anthropic Token Counting API (Added July 2026)
+
+> [!NOTE]
+> **SOTA Update (July 2026)**: The Anthropic Python SDK now provides a `client.messages.count_tokens()` method backed by a server-side `messages-count-tokens` API endpoint. This returns precise token counts for a given message structure. While the dual-local-tokenizer approach remains the default (no network calls, no quota consumption), this endpoint is available as an **optional precision mode** for Anthropic-sourced requests when higher accuracy is needed.
+
+**Usage**: The background worker (never the proxy) can optionally call the Anthropic token counting API for per-component token breakdowns. This uses the same cached OAuth tokens as the eval pipeline. The worker tags these calls with `eval-pipeline:<batch-id>` proxy-auth identity.
+
+**Trade-offs**:
+| Approach | Accuracy | Latency | Quota Cost | Default |
+|:---|:---|:---|:---|:---|
+| Dual local tokenizer | ±5% | ~1ms (local CPU) | None | **✅ Yes** |
+| Anthropic count_tokens API | Exact | ~100-300ms (remote) | Consumes rate limit | Optional |
+
+**Implementation**: The worker checks a configuration flag (`precision_token_count: true/false` in `~/.observability/config.yaml`). When enabled and the provider is Anthropic, the worker uses the API for system prompt and tool definition token counts (the components where the dual tokenizer is least accurate). Conversation history and user message tokens continue to use the local tokenizer for speed.
+
 ### 8.3 Content Versioning
 
 The system tracks changes to static context components across requests:
@@ -908,14 +1004,17 @@ content_versions/
 
 ### 9.2 Phoenix Docker Setup
 
+> [!NOTE]
+> **Validated for Phoenix v19.6.0 (July 24, 2026)**: Phoenix's `pyproject.toml` confirms `aiosqlite>=0.22.1` and `sqlalchemy[asyncio]>=2.0.46` — the SQLite backend remains the default for self-hosted deployments. Phoenix now uses FastAPI (v0.137+) and accepts OTLP traces via gRPC (:4317) or HTTP (`/v1/traces` on the main port). The Docker image tag has moved from `arizephoenix/phoenix:latest` to versioned tags starting at `v4.x`. Pin to a specific version for reproducibility.
+
 ```yaml
-# docker-compose.yml — Arize Phoenix (lightweight)
+# docker-compose.yml — Arize Phoenix v19.6.0 (lightweight)
 version: "3.8"
 services:
   phoenix:
     image: arizephoenix/phoenix:latest
     ports:
-      - "127.0.0.1:6006:6006"    # Phoenix UI (loopback only)
+      - "127.0.0.1:6006:6006"    # Phoenix UI + OTLP HTTP (loopback only)
       - "127.0.0.1:4317:4317"    # OTLP gRPC receiver (loopback only)
     environment:
       - PHOENIX_WORKING_DIR=/data
@@ -989,6 +1088,56 @@ capture:
 | **Total** | **~1.85 GB** | **2.3 cores** | **~32 GB** |
 
 ✅ **Well within the 4 GB RAM constraint** with headroom for growth.
+
+### 9.4 Optional: DuckDB Analytics Layer (Added July 2026)
+
+> [!NOTE]
+> **SOTA Update (July 2026)**: [DuckDB](https://duckdb.org/) has matured into the premier embedded analytical database. It can query JSONL files **directly** via `read_json_auto()` with zero ingestion pipeline — treating newline-delimited JSON as a queryable table on demand. This makes the daily-rotated JSONL archive (§5.4) immediately queryable for ad-hoc analysis without building a separate analytics backend.
+
+**Role**: DuckDB is a **complement** to Phoenix, not a replacement. Phoenix handles trace visualization and span-level exploration. DuckDB enables SQL-based ad-hoc analytics across the raw JSONL archive.
+
+**Usage examples**:
+```sql
+-- Cost by agent, last 7 days
+SELECT agent, SUM(cost.total_cost_usd) AS total_cost
+FROM read_json_auto('~/.observability/logs/*.jsonl')
+WHERE timestamp >= CURRENT_DATE - INTERVAL '7 days'
+GROUP BY agent ORDER BY total_cost DESC;
+
+-- Context composition breakdown for Claude Code sessions
+SELECT
+    agent,
+    AVG(context_composition.system_prompt_tokens) AS avg_system,
+    AVG(context_composition.tool_definitions_tokens) AS avg_tools,
+    AVG(context_composition.conversation_history_tokens) AS avg_history,
+    AVG(context_composition.window_utilization_pct) AS avg_util
+FROM read_json_auto('~/.observability/logs/*.jsonl')
+WHERE agent = 'claude-code'
+GROUP BY agent;
+
+-- Cache efficiency trend
+SELECT
+    DATE(timestamp) AS day,
+    provider,
+    SUM(response.body.usage.cache_read_input_tokens) AS cached_tokens,
+    SUM(response.body.usage.input_tokens) AS total_input_tokens,
+    ROUND(SUM(response.body.usage.cache_read_input_tokens)::FLOAT /
+          NULLIF(SUM(response.body.usage.input_tokens), 0) * 100, 1) AS cache_hit_pct
+FROM read_json_auto('~/.observability/logs/*.jsonl')
+GROUP BY day, provider ORDER BY day DESC, provider;
+```
+
+**Resource Profile**: DuckDB runs as a CLI/on-demand process, not a daemon. It allocates ~100-200 MB during query execution and releases it immediately after. No persistent RAM cost.
+
+**Pre-built Query Library**: The system ships with `~/.observability/queries/` containing parameterized SQL scripts for common analytics:
+- `daily_cost_summary.sql` — Cost per agent/model/day
+- `context_economy.sql` — Context composition trends
+- `cache_efficiency.sql` — Cache hit rates and savings
+- `tool_success_rate.sql` — Tool call quality metrics
+- `latency_decomposition.sql` — TTFT and total latency percentiles
+
+> [!IMPORTANT]
+> **DuckDB vs SQLite (Phoenix)**: DuckDB is columnar OLAP-optimized — ideal for aggregations, GROUP BY, and analytical scans. Phoenix's SQLite is row-oriented OLTP-optimized — ideal for trace insertion and point lookups. Using both leverages each engine's strengths.
 
 ---
 
@@ -1184,7 +1333,7 @@ The worker runs as a separate Python process, polling the staging directory. All
 | W8 | **Content Hashing** | SHA-256 hash system prompts + tool defs for version tracking |
 | W9 | **Credential & Secret Scrubbing** | Two-layer scrubbing: header removal + regex-based body scanner |
 | W10 | **JSONL Writing** | Write scrubbed records to daily-rotated JSONL files via async queue |
-| W11 | **OTLP Span Emission** | Create and export spans to Arize Phoenix via OTLP gRPC on :4317 |
+| W11 | **OTLP Span Export** | Export spans via OTLP gRPC to the local OTel Collector (or directly to Phoenix if Collector is not used). See §12.4 for the Collector pipeline. |
 | W12 | **Tool Span Inference** | Infer tool execution spans from `tool_use` / `tool_result` blocks |
 | W13 | **Skill Discovery Inference** | Detect SKILL.md references and KI lookups in message content |
 | W14 | **Process Tree Resolution** | PID mapping and `pgrep` for sub-agent parent resolution (fallback) |
@@ -1206,6 +1355,81 @@ Because every agent call goes through the proxy, failures must be handled gracef
 
 > [!IMPORTANT]
 > **Fail-Open Principle**: The proxy NEVER blocks or fails agent requests due to observability issues. If staging, the worker, or Phoenix are unavailable, agent traffic continues normally. Telemetry is best-effort.
+
+### 12.4 Optional: OTel Collector Pipeline (Added July 2026)
+
+> [!NOTE]
+> **SOTA Update (July 2026)**: The OpenTelemetry Collector (v0.157.0) now includes GenAI-specific processors that can offload normalization and redaction from the background worker. This is an **optional** pipeline stage — the worker can export directly to Phoenix if simplicity is preferred.
+
+The OTel Collector sits between the background worker and Phoenix:
+
+```
+Background Worker ──▶ OTel Collector (:4317) ──▶ Phoenix (:4318)
+                         │
+                    ├── genainormalizerprocessor (normalizes to gen_ai.* semconv)
+                    ├── redactionprocessor (masks secrets in span attributes)
+                    └── batchprocessor (batches spans for efficient export)
+```
+
+**Collector configuration** (`~/.observability/otel-collector-config.yaml`):
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+
+processors:
+  # Normalize OpenInference/custom attributes to official gen_ai.* semconv
+  genainormalizer:
+    # Alpha stability — normalizes gen_ai.* attributes per v1.43.0 conventions
+
+  # Mask sensitive values in span attributes (complements worker-side scrubbing)
+  redaction:
+    allowed_keys:
+      - gen_ai.system
+      - gen_ai.request.model
+      - gen_ai.usage.*
+      - gen_ai.response.*
+      - session.id
+      - gen_ai.agent.name
+    blocked_values:
+      - patterns:
+        - "(?i)(api[_-]?key|apikey).*"
+        - "sk-[a-zA-Z0-9]{20,}"
+        - "Bearer .*"
+        - "-----BEGIN .*PRIVATE KEY-----"
+
+  batch:
+    timeout: 5s
+    send_batch_size: 256
+
+exporters:
+  otlp/phoenix:
+    endpoint: 127.0.0.1:4318
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [genainormalizer, redaction, batch]
+      exporters: [otlp/phoenix]
+```
+
+**Resource Impact**: OTel Collector adds ~50-100 MB RAM. Updated budget:
+
+| Component | RAM (without Collector) | RAM (with Collector) |
+|:---|:---|:---|
+| mitmproxy + addon | ~150 MB | ~150 MB |
+| Background worker | ~200 MB | ~200 MB |
+| OTel Collector | — | ~50-100 MB |
+| Arize Phoenix | ~1-1.5 GB | ~1-1.5 GB |
+| **Total** | **~1.85 GB** | **~1.95 GB** ✅ (still within 4 GB budget) |
+
+> [!IMPORTANT]
+> **Trade-off Analysis**: The Collector adds a maintained normalization layer (reducing custom code) and defense-in-depth redaction, but adds operational complexity. **Recommendation**: Start Phase 1 without the Collector (direct worker→Phoenix export). Add the Collector in Phase 2 if normalization maintenance becomes burdensome or if the `genainormalizerprocessor` reaches beta stability.
 
 ---
 
@@ -1369,6 +1593,11 @@ Efficiency metrics for the agent's ability to find and use the right tools/skill
 | D13 | Eval scheduler | **Elapsed-time trigger** (not cron). Handles laptop sleep/shutdown. SQLite cursor tracks evaluation progress. |
 | D14 | Telemetry scope | **Proxy-observable** (not white-box). LLM req/res are directly observed; tool/skill/reasoning spans are inferred from content analysis. |
 | D15 | Loopback binding | All services (proxy, Phoenix UI, OTLP receiver) bind to **127.0.0.1 only**. No network exposure. |
+| D16 | OTel namespace | **`gen_ai.*`** (OTel GenAI SemConv v1.43.0). Legacy `llm.*` attributes mapped via mapping table in §5.3. (Updated July 2026) |
+| D17 | Pricing source | **LiteLLM `model_prices_and_context_window.json`** auto-synced daily, with local overrides. Manual `pricing.yaml` retained as fallback. (Added July 2026) |
+| D18 | OTel Collector | **Optional pipeline stage** (Phase 2+). Worker exports directly to Phoenix for Phase 1; Collector with `genainormalizerprocessor` + `redactionprocessor` available when normalization maintenance warrants it. (Added July 2026) |
+| D19 | DuckDB analytics | **Optional complement** to Phoenix. Queries JSONL archive directly via `read_json_auto()`. On-demand CLI, not a daemon. (Added July 2026) |
+| D20 | eBPF interception | **Confirmed not viable on macOS**. mitmproxy + CA cert trust remains the only viable interception path. (Confirmed July 2026) |
 
 ---
 
